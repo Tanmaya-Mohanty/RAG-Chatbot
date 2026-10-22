@@ -1,0 +1,15 @@
+langchain
+langchian-text-splitters
+langchain-community
+langgraph
+dotenv
+langchain-google-genai
+langchain-huggingface
+langgraph-checkpoint-sqlite
+ddgs
+streamlit
+langchain-mcp-adapters
+sentence-transformers
+pypdf
+faiss-cpu
+langchain-ollama
