@@ -26,7 +26,7 @@ primary_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", timeout=10)
 
 # Use Google's API-based embeddings (requires zero local RAM)
 embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/embedding-001", 
+    model="gemini-embedding-001", 
     task_type="retrieval_document"
 )
 
