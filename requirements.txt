@@ -1,5 +1,5 @@
 langchain
-langchian-text-splitters
+langchain-text-splitters
 langchain-community
 langgraph
 dotenv
