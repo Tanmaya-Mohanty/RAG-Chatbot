@@ -12,4 +12,3 @@ langchain-mcp-adapters
 sentence-transformers
 pypdf
 faiss-cpu
-langchain-ollama
