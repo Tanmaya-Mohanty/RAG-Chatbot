@@ -10,9 +10,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_ollama import ChatOllama
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
@@ -22,17 +20,15 @@ import requests
 load_dotenv()
 
 # -------------------
-# 1. LLM + embeddings
+# 1. LLM + embeddings (API Based)
 # -------------------
-primary_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", timeout=5)
+primary_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", timeout=10)
 
-# Local fallback LLM
-fallback_llm = ChatOllama(
-    model="llama3.2:3b",
-    temperature=0,
+# Use Google's API-based embeddings (requires zero local RAM)
+embeddings = GoogleGenerativeAIEmbeddings(
+    model="models/embedding-001", 
+    task_type="retrieval_document"
 )
-
-embeddings = HuggingFaceEmbeddings(model="sentence-transformers/all-MiniLM-L6-v2")
 
 # -------------------
 # 2. PDF retriever store (per thread, in-memory)
@@ -163,7 +159,7 @@ class ChatState(TypedDict):
 # 5. Nodes
 # -------------------
 def chat_node(state: ChatState, config=None):
-    """LLM node that may answer or request a tool call (with fallback)."""
+    """LLM node that answers or requests a tool call."""
     thread_id = None
     if config and isinstance(config, dict):
         thread_id = config.get("configurable", {}).get("thread_id")
@@ -180,15 +176,8 @@ def chat_node(state: ChatState, config=None):
 
     messages = [system_message, *state["messages"]]
 
-    # Try Primary (Gemini)
-    try:
-        bound_primary = primary_llm.bind_tools(tools)
-        response = bound_primary.invoke(messages, config=config)
-    except Exception as e:
-        print(f"[fallback] Primary LLM failed ({e}); switching to local Ollama.")
-        # Fallback to Ollama
-        bound_fallback = fallback_llm.bind_tools(tools)
-        response = bound_fallback.invoke(messages)
+    bound_llm = primary_llm.bind_tools(tools)
+    response = bound_llm.invoke(messages, config=config)
 
     return {"messages": [response]}
 
@@ -227,16 +216,7 @@ def generate_chat_title(first_message: str) -> str:
         HumanMessage(content=first_message),
     ]
     
-    # Try Gemini for title
-    try:
-        title = primary_llm.invoke(prompt).content
-    except Exception as e:
-        print(f"[fallback] Title generation failed with primary ({e}); using local Ollama.")
-        try:
-            title = fallback_llm.invoke(prompt).content
-        except Exception as fallback_e:
-            print(f"[fallback] Title generation failed with Ollama: {fallback_e}")
-            title = first_message[:40]
+    title = primary_llm.invoke(prompt).content
             
     if isinstance(title, list):
         title = " ".join(str(t) for t in title)
