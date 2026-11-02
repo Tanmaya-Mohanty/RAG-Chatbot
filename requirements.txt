@@ -12,3 +12,7 @@ langchain-mcp-adapters
 sentence-transformers
 pypdf
 faiss-cpu
+langchain-ollama
+youtube-transcript-api
+openpyxl
+langchain-groq
