@@ -241,6 +241,7 @@ PREFERRED_LANGS = ["en", "en-US", "en-GB", "hi", "es", "fr", "de", "pt", "ja", "
 _NO_RETRY = {
     "TranscriptsDisabled", "NoTranscriptFound", "VideoUnavailable", "VideoUnplayable",
     "InvalidVideoId", "AgeRestricted", "IpBlocked", "RequestBlocked", "NoSubtitles",
+    "HostedApiError",
 }
 _BLOCK_ERRORS = {"IpBlocked", "RequestBlocked"}
 _TRANSCRIPT_CACHE: Dict[str, tuple] = {}
@@ -352,14 +353,53 @@ def _fetch_with_ytdlp(vid: str):
     raise NoSubtitles("yt-dlp found no subtitle tracks")
 
 
+class HostedApiError(Exception):
+    """Non-retryable error from the hosted transcript API (bad key, no credits, no transcript)."""
+
+
+def _fetch_with_hosted_api(vid: str):
+    """Hosted REST API (transcriptapi.com). The request to YouTube runs on THEIR servers,
+    so it works from cloud hosts where your own IP is blocked. Needs TRANSCRIPT_API_KEY."""
+    key = os.getenv("TRANSCRIPT_API_KEY")
+    if not key:
+        raise HostedApiError("TRANSCRIPT_API_KEY is not set")
+    url = "https://transcriptapi.com/api/v2/youtube/transcript"
+    headers = {"Authorization": f"Bearer {key}"}
+    base = {"video_url": vid, "format": "text", "include_timestamp": "false", "send_metadata": "true"}
+
+    r = requests.get(url, params={**base, "language": ",".join(PREFERRED_LANGS)},
+                     headers=headers, timeout=60)
+    if r.status_code == 404:  # none of the preferred languages: accept whatever exists
+        r = requests.get(url, params=base, headers=headers, timeout=60)
+    if r.status_code in (408, 429, 503):
+        raise RuntimeError(f"hosted API temporary error {r.status_code}")  # retryable
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail")
+        except Exception:
+            detail = r.text[:100]
+        raise HostedApiError(f"{r.status_code}: {detail}")
+    data = r.json()
+    text = data.get("transcript") or ""
+    if isinstance(text, list):
+        text = " ".join(seg.get("text", "") for seg in text)
+    title = (data.get("metadata") or {}).get("title")
+    return " ".join(text.split()), data.get("language"), title
+
+
 def _fetch_transcript(vid: str) -> tuple:
-    """Try youtube-transcript-api, then yt-dlp. Returns (text, language, title)."""
+    """Returns (text, language, title). Hosted API first if configured (works from cloud IPs),
+    then youtube-transcript-api, then yt-dlp."""
     if vid in _TRANSCRIPT_CACHE:
         return _TRANSCRIPT_CACHE[vid]
 
+    methods = [("youtube-transcript-api", _fetch_with_ytapi), ("yt-dlp", _fetch_with_ytdlp)]
+    if os.getenv("TRANSCRIPT_API_KEY"):
+        methods.insert(0, ("hosted-api", _fetch_with_hosted_api))
+
     errors: list[str] = []
     blocked = False
-    for name, fn in (("youtube-transcript-api", _fetch_with_ytapi), ("yt-dlp", _fetch_with_ytdlp)):
+    for name, fn in methods:
         for attempt in range(2):
             try:
                 text, lang, title = fn(vid)
@@ -379,7 +419,8 @@ def _fetch_transcript(vid: str) -> tuple:
     hint = ""
     if blocked:
         hint = (" YouTube appears to be blocking this server's IP. Run the app locally, "
-                "or set WEBSHARE_PROXY_USERNAME/PASSWORD or YT_PROXY_URL in your environment.")
+                "or set TRANSCRIPT_API_KEY (hosted API), WEBSHARE_PROXY_USERNAME/PASSWORD or "
+                "YT_PROXY_URL, or paste the transcript manually.")
     raise ValueError(f"Could not fetch transcript for {vid}. " + " | ".join(errors) + hint)
 
 
@@ -401,6 +442,18 @@ def ingest_youtube(url_or_id: str, thread_id: str, title: Optional[str] = None) 
     return meta
 
 
+def ingest_transcript_text(text: str, thread_id: str, title: Optional[str] = None) -> dict:
+    """Manual fallback: index a transcript the user pasted/uploaded (no YouTube access needed)."""
+    text = " ".join((text or "").split())
+    if len(text) < 20:
+        raise ValueError("Transcript text is empty or too short.")
+    name = (title or "").strip() or f"Pasted transcript ({text[:30]}…)"
+    chunks = _split([Document(page_content=text, metadata={"source": "manual_transcript"})])
+    meta = {"type": "youtube", "filename": name, "language": None, "chunks": len(chunks)}
+    _add_source(thread_id, f"transcript:{name}", chunks, meta)
+    return meta
+
+
 # ---------- Dispatcher ----------
 def ingest_document(kind: str, payload: Any, thread_id: str, filename: Optional[str] = None) -> dict:
     if kind == "pdf":
@@ -409,6 +462,8 @@ def ingest_document(kind: str, payload: Any, thread_id: str, filename: Optional[
         return ingest_excel(payload, thread_id, filename)
     if kind == "youtube":
         return ingest_youtube(payload, thread_id, filename)
+    if kind == "transcript_text":
+        return ingest_transcript_text(payload, thread_id, filename)
     raise ValueError(f"Unsupported kind: {kind}")
 
 
