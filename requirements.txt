@@ -16,3 +16,5 @@ langchain-ollama
 youtube-transcript-api
 openpyxl
 langchain-groq
+torchvision
+yt-dlp
