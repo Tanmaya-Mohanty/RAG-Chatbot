@@ -3,70 +3,81 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import threading
+import time
 from typing import Annotated, Any, Dict, Optional, TypedDict
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-
-# The drop-in replacement for youtube-transcript-api
-from transcriptout import YouTubeTranscriptApi
 
 load_dotenv()
 
 # -------------------
 # 1. LLM + embeddings
 # -------------------
+# timeout / max_retries make transient upstream 502/503/429 errors from Groq
+# retry automatically instead of crashing the app.
 llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0
+    model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+    temperature=0,
+    max_retries=3,
+    timeout=60,
 )
-embeddings = HuggingFaceEmbeddings(model="sentence-transformers/all-MiniLM-L6-v2")
+
+# Embeddings are loaded lazily: importing torch + the model at import time makes
+# startup slow / memory-heavy, which is a classic cause of 502 on hosted platforms
+# (the health check fails before Streamlit is ready, or the container is OOM-killed).
+_embeddings: Optional[HuggingFaceEmbeddings] = None
+_emb_lock = threading.Lock()
+
+
+def get_embeddings() -> HuggingFaceEmbeddings:
+    global _embeddings
+    with _emb_lock:
+        if _embeddings is None:
+            _embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                model_kwargs={"device": "cpu"},
+                encode_kwargs={"batch_size": 32},
+            )
+        return _embeddings
+
 
 # -------------------
 # 2. Per-thread stores (in memory only)
 # -------------------
+_LOCK = threading.RLock()
 _THREAD_SOURCE_DOCS: Dict[str, Dict[str, list[Document]]] = {}
-_THREAD_RETRIEVERS: Dict[str, Any] = {}
+_THREAD_STORES: Dict[str, FAISS] = {}
 _THREAD_METADATA: Dict[str, Dict[str, dict]] = {}
 _THREAD_TITLES: Dict[str, str] = {}
 
+MAX_EXCEL_ROWS_PER_SHEET = int(os.getenv("MAX_EXCEL_ROWS_PER_SHEET", "5000"))
+
 
 def _get_retriever(thread_id: Optional[str]):
-    if thread_id and str(thread_id) in _THREAD_RETRIEVERS:
-        return _THREAD_RETRIEVERS[str(thread_id)]
-    return None
-
-
-# ---------- helpers ----------
-def _youtube_id(url_or_id: str) -> Optional[str]:
-    if re.fullmatch(r"[A-Za-z0-9_-]{11}", url_or_id):
-        return url_or_id
-    patterns = [
-        r"(?:youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})",
-        r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
-        r"(?:youtube\.com/embed/)([A-Za-z0-9_-]{11})",
-        r"(?:youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
-    ]
-    for p in patterns:
-        m = re.search(p, url_or_id)
-        if m:
-            return m.group(1)
-    return None
+    if not thread_id:
+        return None
+    store = _THREAD_STORES.get(str(thread_id))
+    if store is None:
+        return None
+    return store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
 
 
 def _split(docs: list[Document]) -> list[Document]:
@@ -76,41 +87,50 @@ def _split(docs: list[Document]) -> list[Document]:
     return splitter.split_documents(docs)
 
 
-def _rebuild_retriever(thread_id: str) -> None:
-    tid = str(thread_id)
+def _rebuild_store(tid: str) -> None:
     sources = _THREAD_SOURCE_DOCS.get(tid, {})
     all_chunks = [c for chunks in sources.values() for c in chunks]
     if not all_chunks:
-        _THREAD_RETRIEVERS.pop(tid, None)
+        _THREAD_STORES.pop(tid, None)
         _THREAD_METADATA.pop(tid, None)
         _THREAD_SOURCE_DOCS.pop(tid, None)
         return
-    _THREAD_RETRIEVERS[tid] = FAISS.from_documents(
-        all_chunks, embeddings
-    ).as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    _THREAD_STORES[tid] = FAISS.from_documents(all_chunks, get_embeddings())
 
 
 def _add_source(thread_id: str, source_key: str, chunks: list[Document], meta: dict) -> None:
+    if not chunks:
+        raise ValueError("No extractable text found in this source.")
     tid = str(thread_id)
-    _THREAD_SOURCE_DOCS.setdefault(tid, {})[source_key] = chunks
-    _THREAD_METADATA.setdefault(tid, {})[source_key] = meta
-    _rebuild_retriever(tid)
+    with _LOCK:
+        sources = _THREAD_SOURCE_DOCS.setdefault(tid, {})
+        replacing = source_key in sources
+        sources[source_key] = chunks
+        _THREAD_METADATA.setdefault(tid, {})[source_key] = meta
+        if replacing or tid not in _THREAD_STORES:
+            _rebuild_store(tid)
+        else:
+            # Incremental: only embed the NEW chunks instead of re-embedding everything.
+            _THREAD_STORES[tid].add_documents(chunks)
 
 
 def reset_thread_source(thread_id: str, source_key: str) -> None:
     tid = str(thread_id)
-    if tid not in _THREAD_SOURCE_DOCS:
-        return
-    _THREAD_SOURCE_DOCS[tid].pop(source_key, None)
-    _THREAD_METADATA.get(tid, {}).pop(source_key, None)
-    _rebuild_retriever(tid)
+    with _LOCK:
+        if tid not in _THREAD_SOURCE_DOCS:
+            return
+        _THREAD_SOURCE_DOCS[tid].pop(source_key, None)
+        _THREAD_METADATA.get(tid, {}).pop(source_key, None)
+        _rebuild_store(tid)
 
 
 def reset_thread(thread_id: str) -> None:
     tid = str(thread_id)
-    _THREAD_SOURCE_DOCS.pop(tid, None)
-    _THREAD_RETRIEVERS.pop(tid, None)
-    _THREAD_METADATA.pop(tid, None)
+    with _LOCK:
+        _THREAD_SOURCE_DOCS.pop(tid, None)
+        _THREAD_STORES.pop(tid, None)
+        _THREAD_METADATA.pop(tid, None)
+
 
 def generate_thread_title(first_user_message: str, max_words: int = 6) -> str:
     prompt = (
@@ -144,6 +164,9 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
         path = f.name
     try:
         docs = PyPDFLoader(path).load()
+        docs = [d for d in docs if d.page_content.strip()]
+        if not docs:
+            raise ValueError("No text found in the PDF (it may be a scanned image; OCR is needed).")
         chunks = _split(docs)
         fname = filename or os.path.basename(path)
         meta = {"type": "pdf", "filename": fname, "documents": len(docs), "chunks": len(chunks)}
@@ -172,7 +195,9 @@ def ingest_excel(file_bytes: bytes, thread_id: str, filename: Optional[str] = No
             df = xls.parse(sheet)
             if df.empty:
                 continue
+            df = df.head(MAX_EXCEL_ROWS_PER_SHEET)  # keep embedding time bounded
             df.columns = [str(c).strip() for c in df.columns]
+            df = df.loc[:, ~pd.Index(df.columns).duplicated()]
             for idx, row in df.iterrows():
                 pairs = [
                     f"{col}: {row[col]}"
@@ -186,17 +211,20 @@ def ingest_excel(file_bytes: bytes, thread_id: str, filename: Optional[str] = No
                     page_content=f"[Sheet: {sheet} | Row {idx + 1}] " + ", ".join(pairs),
                     metadata={"sheet": sheet, "row": int(idx) + 1},
                 ))
-            csv_dump = df.to_csv(index=False).strip()
-            if csv_dump:
-                docs.append(Document(
-                    page_content=f"[Sheet: {sheet} | CSV dump]\n{csv_dump}",
-                    metadata={"sheet": sheet, "kind": "sheet_summary"},
-                ))
+            # A full CSV dump is only useful (and cheap) for small sheets.
+            if len(df) <= 200:
+                csv_dump = df.to_csv(index=False).strip()
+                if csv_dump:
+                    docs.append(Document(
+                        page_content=f"[Sheet: {sheet} | CSV dump]\n{csv_dump}",
+                        metadata={"sheet": sheet, "kind": "sheet_summary"},
+                    ))
         if not docs:
             raise ValueError("Excel file had no non-empty rows.")
         chunks = _split(docs)
         fname = filename or os.path.basename(path)
-        meta = {"type": "excel", "filename": fname, "sheets": xls.sheet_names, "rows": total_rows, "chunks": len(chunks)}
+        meta = {"type": "excel", "filename": fname, "sheets": xls.sheet_names,
+                "rows": total_rows, "chunks": len(chunks)}
         _add_source(thread_id, f"excel:{fname}", chunks, meta)
         return meta
     finally:
@@ -207,62 +235,168 @@ def ingest_excel(file_bytes: bytes, thread_id: str, filename: Optional[str] = No
 
 
 # ---------- YouTube ----------
+PREFERRED_LANGS = ["en", "en-US", "en-GB", "hi", "es", "fr", "de", "pt", "ja", "zh"]
+
+# Errors where retrying is pointless (video has no captions, or YouTube is blocking our IP).
+_NO_RETRY = {
+    "TranscriptsDisabled", "NoTranscriptFound", "VideoUnavailable", "VideoUnplayable",
+    "InvalidVideoId", "AgeRestricted", "IpBlocked", "RequestBlocked", "NoSubtitles",
+}
+_BLOCK_ERRORS = {"IpBlocked", "RequestBlocked"}
+_TRANSCRIPT_CACHE: Dict[str, tuple] = {}
+
+
+class NoSubtitles(Exception):
+    pass
+
+
+def _youtube_id(url_or_id: str) -> Optional[str]:
+    s = url_or_id.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+        return s
+    if "://" not in s:
+        s = "https://" + s
+    try:
+        u = urlparse(s)
+    except ValueError:
+        return None
+    host = (u.hostname or "").lower()
+    for prefix in ("www.", "m.", "music."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    cand = ""
+    if host == "youtu.be":
+        cand = u.path.lstrip("/").split("/")[0]
+    elif host in ("youtube.com", "youtube-nocookie.com"):
+        if u.path == "/watch":
+            cand = parse_qs(u.query).get("v", [""])[0]
+        else:
+            parts = [p for p in u.path.split("/") if p]
+            if len(parts) >= 2 and parts[0] in ("embed", "shorts", "live", "v"):
+                cand = parts[1]
+    return cand if re.fullmatch(r"[A-Za-z0-9_-]{11}", cand) else None
+
+
+def _proxy_config():
+    """Optional proxy for youtube-transcript-api. YouTube blocks most cloud/datacenter IPs,
+    so on a hosted deployment you normally NEED a (residential) proxy."""
+    try:
+        from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
+    except Exception:
+        return None
+    user = os.getenv("WEBSHARE_PROXY_USERNAME")
+    pwd = os.getenv("WEBSHARE_PROXY_PASSWORD")
+    if user and pwd:
+        return WebshareProxyConfig(proxy_username=user, proxy_password=pwd)
+    url = os.getenv("YT_PROXY_URL")
+    if url:
+        return GenericProxyConfig(http_url=url, https_url=url)
+    return None
+
+
+def _fetch_with_ytapi(vid: str):
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    api = YouTubeTranscriptApi(proxy_config=_proxy_config())
+    try:
+        fetched = api.fetch(vid, languages=PREFERRED_LANGS)
+        lang = getattr(fetched, "language_code", None)
+    except Exception as e:
+        if type(e).__name__ != "NoTranscriptFound":
+            raise
+        # Preferred languages missing: take any available track, manual before auto-generated.
+        candidates = sorted(list(api.list(vid)), key=lambda t: bool(getattr(t, "is_generated", False)))
+        if not candidates:
+            raise
+        chosen = candidates[0]
+        fetched = chosen.fetch()
+        lang = getattr(chosen, "language_code", None)
+    raw = fetched.to_raw_data()
+    text = " ".join(seg["text"] for seg in raw if seg.get("text"))
+    return " ".join(text.split()), lang, None
+
+
+def _fetch_with_ytdlp(vid: str):
+    import yt_dlp
+
+    proxy = os.getenv("YT_PROXY_URL")
+    opts: dict = {"skip_download": True, "quiet": True, "no_warnings": True, "noplaylist": True}
+    if proxy:
+        opts["proxy"] = proxy
+    cookies = os.getenv("YT_COOKIES_FILE")
+    if cookies and os.path.exists(cookies):
+        opts["cookiefile"] = cookies
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+
+    title = info.get("title")
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    for pool in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
+        langs = [l for l in PREFERRED_LANGS if l in pool] + [l for l in pool if l not in PREFERRED_LANGS]
+        for lang in langs:
+            if lang == "live_chat":
+                continue
+            track = next((t for t in pool[lang] if t.get("ext") == "json3"), None)
+            if not track:
+                continue
+            r = requests.get(track["url"], timeout=20, proxies=proxies)
+            r.raise_for_status()
+            events = r.json().get("events", [])
+            text = " ".join(
+                "".join(s.get("utf8", "") for s in e["segs"]) for e in events if e.get("segs")
+            )
+            text = " ".join(text.split())
+            if text:
+                return text, lang, title
+    raise NoSubtitles("yt-dlp found no subtitle tracks")
+
+
+def _fetch_transcript(vid: str) -> tuple:
+    """Try youtube-transcript-api, then yt-dlp. Returns (text, language, title)."""
+    if vid in _TRANSCRIPT_CACHE:
+        return _TRANSCRIPT_CACHE[vid]
+
+    errors: list[str] = []
+    blocked = False
+    for name, fn in (("youtube-transcript-api", _fetch_with_ytapi), ("yt-dlp", _fetch_with_ytdlp)):
+        for attempt in range(2):
+            try:
+                text, lang, title = fn(vid)
+                if not text:
+                    raise ValueError("empty transcript")
+                _TRANSCRIPT_CACHE[vid] = (text, lang, title)
+                return text, lang, title
+            except Exception as e:
+                ename = type(e).__name__
+                errors.append(f"{name}: {ename}: {str(e).splitlines()[0][:160] if str(e) else ''}")
+                if ename in _BLOCK_ERRORS or "Sign in to confirm" in str(e) or "429" in str(e):
+                    blocked = True
+                if ename in _NO_RETRY:
+                    break
+                time.sleep(1.5 * (attempt + 1))
+
+    hint = ""
+    if blocked:
+        hint = (" YouTube appears to be blocking this server's IP. Run the app locally, "
+                "or set WEBSHARE_PROXY_USERNAME/PASSWORD or YT_PROXY_URL in your environment.")
+    raise ValueError(f"Could not fetch transcript for {vid}. " + " | ".join(errors) + hint)
+
+
 def ingest_youtube(url_or_id: str, thread_id: str, title: Optional[str] = None) -> dict:
-    vid = _youtube_id(url_or_id.strip())
+    vid = _youtube_id(url_or_id)
     if not vid:
         raise ValueError("Could not parse a YouTube video ID from the input.")
 
-    preferred_langs = ["en", "en-US", "en-GB", "hi", "es", "fr", "de", "pt", "ja", "zh"]
-    
-    try:
-        # transcriptout handles the IP blocking automatically via its API
-        ytt_api = YouTubeTranscriptApi()
-        
-        fetched = None
-        try:
-            fetched = ytt_api.fetch(vid, languages=preferred_langs)
-            used_lang = getattr(fetched, "language_code", None)
-        except Exception:
-            pass
-            
-        if fetched is None:
-            try:
-                listing = ytt_api.list(vid)
-                candidates = list(listing)
-                if not candidates:
-                    raise ValueError("No transcripts available.")
-                candidates.sort(key=lambda t: (not getattr(t, "is_generated", False)))
-                chosen = candidates[0]
-                fetched = chosen.fetch()
-                used_lang = getattr(chosen, "language_code", None)
-            except Exception as e:
-                raise ValueError(f"Could not list transcripts: {e}")
-                
-        if fetched is None:
-            raise ValueError("No transcripts could be fetched.")
-
-        try:
-            raw = fetched.to_raw_data()
-        except Exception:
-            raw = list(fetched)
-
-        text = " ".join(
-            (seg.get("text") if isinstance(seg, dict) else seg.text) for seg in raw
-        ).strip()
-        
-        if not text:
-            raise ValueError(f"Transcript for {vid} was empty.")
-            
-    except Exception as e:
-        raise ValueError(f"Failed to fetch transcript for {vid}. Error: {e}")
-
+    text, used_lang, fetched_title = _fetch_transcript(vid)
     docs = [Document(
         page_content=text,
         metadata={"video_id": vid, "url": f"https://youtu.be/{vid}", "language": used_lang},
     )]
     chunks = _split(docs)
-    fname = title or f"YouTube {vid}"
-    meta = {"type": "youtube", "filename": fname, "video_id": vid, "language": used_lang, "chunks": len(chunks)}
+    fname = title or fetched_title or f"YouTube {vid}"
+    meta = {"type": "youtube", "filename": fname, "video_id": vid,
+            "language": used_lang, "chunks": len(chunks)}
     _add_source(thread_id, f"youtube:{vid}", chunks, meta)
     return meta
 
@@ -283,33 +417,56 @@ def ingest_document(kind: str, payload: Any, thread_id: str, filename: Optional[
 # -------------------
 search_tool = DuckDuckGoSearchRun(region="us-en")
 
+
 @tool
 def calculator(first_num: float, second_num: float, operation: str) -> dict:
     """Perform a basic arithmetic operation on two numbers. Supported: add, sub, mul, div."""
     try:
-        if operation == "add": result = first_num + second_num
-        elif operation == "sub": result = first_num - second_num
-        elif operation == "mul": result = first_num * second_num
+        if operation == "add":
+            result = first_num + second_num
+        elif operation == "sub":
+            result = first_num - second_num
+        elif operation == "mul":
+            result = first_num * second_num
         elif operation == "div":
-            if second_num == 0: return {"error": "Division by zero is not allowed"}
+            if second_num == 0:
+                return {"error": "Division by zero is not allowed"}
             result = first_num / second_num
-        else: return {"error": f"Unsupported operation '{operation}'"}
-        return {"first_num": first_num, "second_num": second_num, "operation": operation, "result": result}
+        else:
+            return {"error": f"Unsupported operation '{operation}'"}
+        return {"first_num": first_num, "second_num": second_num,
+                "operation": operation, "result": result}
     except Exception as e:
         return {"error": str(e)}
+
 
 @tool
 def get_stock_price(symbol: str) -> dict:
     """Fetch latest stock price for a symbol (e.g. 'AAPL') via Alpha Vantage."""
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=C9PE94QUEW9VWGFM"
-    return requests.get(url).json()
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+    if not api_key:
+        return {"error": "ALPHAVANTAGE_API_KEY is not configured on the server."}
+    try:
+        resp = requests.get(
+            "https://www.alphavantage.co/query",
+            params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": api_key},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        return {"error": f"Stock lookup failed: {e}"}
+
 
 @tool
-def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
-    """Retrieve relevant chunks from PDFs / Excel sheets / YouTube transcripts in this thread."""
+def rag_tool(query: str, config: RunnableConfig) -> dict:
+    """Retrieve relevant chunks from the PDFs / Excel sheets / YouTube transcripts indexed in this chat."""
+    # thread_id comes from the run config, so the LLM can never pass a wrong/hallucinated id.
+    thread_id = ((config or {}).get("configurable") or {}).get("thread_id")
     retriever = _get_retriever(thread_id)
     if retriever is None:
-        return {"error": "No document indexed for this chat. Upload a file or add a YouTube link first.", "query": query}
+        return {"error": "No document indexed for this chat. Upload a file or add a YouTube link first.",
+                "query": query}
     result = retriever.invoke(query)
     result = [d for d in result if d.page_content.split("]", 1)[-1].strip()]
     return {
@@ -334,19 +491,17 @@ class ChatState(TypedDict):
 # -------------------
 # 5. Nodes
 # -------------------
-def chat_node(state: ChatState, config=None):
-    thread_id = None
-    if config and isinstance(config, dict):
-        thread_id = config.get("configurable", {}).get("thread_id")
-
+def chat_node(state: ChatState, config: RunnableConfig = None):
+    thread_id = ((config or {}).get("configurable") or {}).get("thread_id")
     sources = list(_THREAD_METADATA.get(str(thread_id), {}).keys())
-    sources_hint = f"Indexed sources for this chat: {sources}. " if sources else "No document is indexed for this chat yet. "
+    sources_hint = (f"Indexed sources for this chat: {sources}. "
+                    if sources else "No document is indexed for this chat yet. ")
 
     system_message = SystemMessage(
         content=(
             "You are a helpful assistant. For questions about indexed content "
-            "(PDFs, Excel sheets, YouTube transcripts), call `rag_tool` and include "
-            f"the thread_id `{thread_id}`. {sources_hint}"
+            "(PDFs, Excel sheets, YouTube transcripts), call `rag_tool` with just the query. "
+            f"{sources_hint}"
             "You can also use web search, stock price, and calculator tools when helpful. "
             "If no source is indexed and the user asks about a document, ask them to upload one. "
             "Never echo raw tool arguments back to the user; answer in natural language."
@@ -377,20 +532,26 @@ chatbot = graph.compile(checkpointer=checkpointer)
 def retrieve_all_threads() -> list[str]:
     return list(_THREAD_TITLES.keys())
 
+
 def thread_has_document(thread_id: str) -> bool:
-    return str(thread_id) in _THREAD_RETRIEVERS
+    return str(thread_id) in _THREAD_STORES
+
 
 def thread_document_metadata(thread_id: str) -> dict:
     meta = _THREAD_METADATA.get(str(thread_id), {})
-    if not meta: return {}
+    if not meta:
+        return {}
     latest_key = list(meta.keys())[-1]
     latest = dict(meta[latest_key])
     latest["all_sources"] = [m.get("filename") for m in meta.values()]
     return latest
 
+
 def set_thread_title(thread_id: str, title: str) -> None:
     tid = str(thread_id)
-    if tid and title: _THREAD_TITLES[tid] = title.strip()[:60]
+    if tid and title:
+        _THREAD_TITLES[tid] = title.strip()[:60]
+
 
 def get_thread_title(thread_id: str) -> str:
     return _THREAD_TITLES.get(str(thread_id), str(thread_id))
