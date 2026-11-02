@@ -22,8 +22,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.proxies import GenericProxyConfig
+
+# The drop-in replacement for youtube-transcript-api
+from transcriptout import YouTubeTranscriptApi
 
 load_dotenv()
 
@@ -212,25 +213,17 @@ def ingest_youtube(url_or_id: str, thread_id: str, title: Optional[str] = None) 
         raise ValueError("Could not parse a YouTube video ID from the input.")
 
     preferred_langs = ["en", "en-US", "en-GB", "hi", "es", "fr", "de", "pt", "ja", "zh"]
-    text = ""
-    used_lang = "unknown"
-    last_error = None
-    PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", None)
-
-    # --- ATTEMPT 1: youtube-transcript-api ---
+    
     try:
-        proxy_config = None
-        if PROXY_URL:
-            proxy_config = GenericProxyConfig(http_url=PROXY_URL, https_url=PROXY_URL)
-        
-        ytt_api = YouTubeTranscriptApi(proxy_config=proxy_config) if proxy_config else YouTubeTranscriptApi()
+        # transcriptout handles the IP blocking automatically via its API
+        ytt_api = YouTubeTranscriptApi()
         
         fetched = None
         try:
             fetched = ytt_api.fetch(vid, languages=preferred_langs)
             used_lang = getattr(fetched, "language_code", None)
-        except Exception as e:
-            last_error = e
+        except Exception:
+            pass
             
         if fetched is None:
             try:
@@ -243,88 +236,25 @@ def ingest_youtube(url_or_id: str, thread_id: str, title: Optional[str] = None) 
                 fetched = chosen.fetch()
                 used_lang = getattr(chosen, "language_code", None)
             except Exception as e:
-                last_error = e
+                raise ValueError(f"Could not list transcripts: {e}")
                 
-        if fetched is not None:
-            try:
-                raw = fetched.to_raw_data()
-            except Exception:
-                raw = list(fetched)
+        if fetched is None:
+            raise ValueError("No transcripts could be fetched.")
 
-            text = " ".join(
-                (seg.get("text") if isinstance(seg, dict) else seg.text) for seg in raw
-            ).strip()
-        
-    except Exception as e:
-        last_error = e
-        text = "" # Force fallback
-
-    # --- ATTEMPT 2: yt-dlp (with iOS client) ---
-    if not text:
         try:
-            import yt_dlp
-            import json
-            import urllib.request
-            
-            ydl_opts = {
-                'skip_download': True,
-                'writesubtitles': True,
-                'writeautomaticsub': True,
-                'subtitleslangs': preferred_langs,
-                'quiet': True,
-                'no_warnings': True,
-                'http_headers': {'User-Agent': 'com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)'},
-                'extractor_args': {'youtube': {'player_client': ['ios']}}
-            }
-            
-            if PROXY_URL:
-                ydl_opts['proxy'] = PROXY_URL
+            raw = fetched.to_raw_data()
+        except Exception:
+            raw = list(fetched)
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-                subs = info.get('subtitles', {})
-                auto_subs = info.get('automatic_captions', {})
-                
-                chosen_lang = next((lang for lang in preferred_langs if lang in subs or lang in auto_subs), None)
-                
-                if chosen_lang:
-                    used_lang = chosen_lang
-                    sub_info = subs.get(chosen_lang, auto_subs.get(chosen_lang))
-                    sub_url = next((f['url'] for f in sub_info if f.get('ext') == 'json3'), None)
-                    if not sub_url:
-                        sub_url = next((f['url'] for f in sub_info if f.get('ext') == 'vtt'), None)
-                        
-                    if sub_url:
-                        req = urllib.request.Request(sub_url, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(req) as response:
-                            sub_data = response.read().decode('utf-8')
-                            
-                            if 'json3' in sub_url:
-                                data = json.loads(sub_data)
-                                text = " ".join(
-                                    "".join(seg.get("utf8", "") for seg in event.get("segs", []))
-                                    for event in data.get("events", [])
-                                    if "segs" in event
-                                )
-                            else: # vtt parsing
-                                lines = sub_data.split('\n')
-                                text = " ".join(
-                                    line for line in lines 
-                                    if line.strip() and not line.startswith(('WEBVTT', 'Kind:', 'Language:', 'NOTE')) 
-                                    and '-->' not in line and not line.strip().isdigit()
-                                ).replace('<c>', '').replace('</c>', '').replace('<v ', '').replace('</v>', '')
-                                
-        except Exception as fallback_err:
-            error_msg = str(last_error)
-            if "Sign in to confirm" in str(fallback_err) or "bot" in str(fallback_err):
-                error_msg = "YouTube is blocking this server's IP address. YOU MUST ADD A PROXY URL TO YOUR ENVIRONMENT VARIABLES (YOUTUBE_PROXY_URL)."
-            else:
-                error_msg += f" | Fallback Error: {fallback_err}"
-            raise ValueError(f"Could not fetch transcript for {vid}. {error_msg}")
-
-    text = " ".join(text.split()) # Clean up
-    if not text:
-        raise ValueError(f"Transcript for {vid} was empty.")
+        text = " ".join(
+            (seg.get("text") if isinstance(seg, dict) else seg.text) for seg in raw
+        ).strip()
+        
+        if not text:
+            raise ValueError(f"Transcript for {vid} was empty.")
+            
+    except Exception as e:
+        raise ValueError(f"Failed to fetch transcript for {vid}. Error: {e}")
 
     docs = [Document(
         page_content=text,

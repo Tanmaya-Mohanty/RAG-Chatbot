@@ -18,3 +18,4 @@ openpyxl
 langchain-groq
 torchvision
 yt-dlp
+transcriptout
