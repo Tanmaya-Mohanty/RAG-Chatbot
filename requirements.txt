@@ -2,7 +2,6 @@ langchain
 langchain-text-splitters
 langchain-community
 langgraph
-dotenv
 langchain-google-genai
 langchain-huggingface
 langgraph-checkpoint-sqlite
@@ -16,6 +15,5 @@ langchain-ollama
 youtube-transcript-api
 openpyxl
 langchain-groq
-torchvision
 yt-dlp
 transcriptout
